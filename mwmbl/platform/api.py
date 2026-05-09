@@ -621,6 +621,8 @@ def create_checkout(request, body: CheckoutRequest):
         checkout_params["external_customer_id"] = billing.polar_customer_id
     if body.success_url:
         checkout_params["success_url"] = body.success_url
+    if body.embed_origin:
+        checkout_params["embed_origin"] = body.embed_origin
     with Polar(access_token=settings.POLAR_ACCESS_TOKEN, server=settings.POLAR_SERVER) as polar:
         result = polar.checkouts.create(request=checkout_params)
     return CheckoutResponse(checkout_url=result.url)
