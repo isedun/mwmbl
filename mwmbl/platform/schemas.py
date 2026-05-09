@@ -23,6 +23,7 @@ class SubscriptionResponse(Schema):
 
 class CheckoutRequest(Schema):
     plan: Literal["starter", "pro"]
+    success_url: Optional[str] = None
 
 
 class CheckoutResponse(Schema):
