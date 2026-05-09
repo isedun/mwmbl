@@ -619,7 +619,7 @@ def create_checkout(request, body: CheckoutRequest):
     }
     if billing and billing.polar_customer_id:
         checkout_params["external_customer_id"] = billing.polar_customer_id
-    with Polar(access_token=settings.POLAR_ACCESS_TOKEN) as polar:
+    with Polar(access_token=settings.POLAR_ACCESS_TOKEN, server=settings.POLAR_SERVER) as polar:
         result = polar.checkouts.create(request=checkout_params)
     return CheckoutResponse(checkout_url=result.url)
 
