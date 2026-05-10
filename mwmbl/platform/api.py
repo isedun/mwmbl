@@ -1,3 +1,5 @@
+import logging
+
 from allauth.account.adapter import get_adapter
 from allauth.account.models import EmailConfirmationHMAC
 from allauth.account.utils import setup_user_email, send_email_confirmation
@@ -20,6 +22,8 @@ from mwmbl.platform.schemas import (
     ForgotPasswordRequest, ResetPasswordRequest,
     AgreementAcceptRequest, AgreementResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 router = Router(tags=["Platform"])
 
@@ -635,6 +639,7 @@ def create_checkout(request, body: CheckoutRequest):
     tags=["Billing"],
 )
 def polar_webhook(request):
+    logger.info("Polar webhook received")
     try:
         event = validate_event(
             payload=request.body,
@@ -642,7 +647,10 @@ def polar_webhook(request):
             secret=settings.POLAR_WEBHOOK_SECRET,
         )
     except WebhookVerificationError:
+        logger.warning("Polar webhook: invalid signature")
         raise InvalidRequest("Invalid signature", status=400)
+
+    logger.info("Polar webhook event type=%s product_id=%s", event.type, getattr(event.data, "product_id", None))
 
     product_tier = {
         settings.POLAR_PRODUCT_ID_STARTER: MwmblUser.Tier.STARTER,
@@ -651,23 +659,36 @@ def polar_webhook(request):
 
     if event.type in ("subscription.active", "subscription.updated"):
         user_id = event.data.metadata.get("user_id")
+        logger.info("Polar webhook: subscription active/updated user_id=%s", user_id)
         user = MwmblUser.objects.filter(id=user_id).first()
-        if user:
+        if user is None:
+            logger.warning("Polar webhook: no user found for user_id=%s", user_id)
+        else:
             tier = product_tier.get(event.data.product_id, MwmblUser.Tier.FREE)
+            logger.info("Polar webhook: setting user %s (id=%s) tier to %s (product_id=%s)", user.email, user_id, tier, event.data.product_id)
+            if tier == MwmblUser.Tier.FREE:
+                logger.warning("Polar webhook: product_id=%s not found in product_tier map, defaulting to FREE", event.data.product_id)
             user.tier = tier
             user.save()
             invalidate_user_api_key_cache(user.id)
-            billing, _ = UserBilling.objects.get_or_create(user=user)
+            billing, created = UserBilling.objects.get_or_create(user=user)
+            logger.info("Polar webhook: UserBilling %s for user %s customer_id=%s subscription_id=%s", "created" if created else "updated", user.email, event.data.customer_id, event.data.id)
             billing.polar_customer_id = event.data.customer_id or billing.polar_customer_id
             billing.polar_subscription_id = event.data.id or billing.polar_subscription_id
             billing.save()
     elif event.type in ("subscription.revoked", "subscription.canceled"):
         user_id = event.data.metadata.get("user_id")
+        logger.info("Polar webhook: subscription revoked/canceled user_id=%s", user_id)
         user = MwmblUser.objects.filter(id=user_id).first()
-        if user:
+        if user is None:
+            logger.warning("Polar webhook: no user found for user_id=%s", user_id)
+        else:
+            logger.info("Polar webhook: reverting user %s (id=%s) to FREE", user.email, user_id)
             user.tier = MwmblUser.Tier.FREE
             user.save()
             invalidate_user_api_key_cache(user.id)
+    else:
+        logger.info("Polar webhook: unhandled event type=%s, ignoring", event.type)
 
     return {"status": "ok"}
 
