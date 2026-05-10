@@ -650,14 +650,15 @@ def polar_webhook(request):
         logger.warning("Polar webhook: invalid signature")
         raise InvalidRequest("Invalid signature", status=400)
 
-    logger.info("Polar webhook event type=%s product_id=%s", event.type, getattr(event.data, "product_id", None))
+    event_type = event.TYPE
+    logger.info("Polar webhook event type=%s product_id=%s", event_type, getattr(event.data, "product_id", None))
 
     product_tier = {
         settings.POLAR_PRODUCT_ID_STARTER: MwmblUser.Tier.STARTER,
         settings.POLAR_PRODUCT_ID_PRO: MwmblUser.Tier.PRO,
     }
 
-    if event.type in ("subscription.active", "subscription.updated"):
+    if event_type in ("subscription.active", "subscription.updated"):
         user_id = event.data.metadata.get("user_id")
         logger.info("Polar webhook: subscription active/updated user_id=%s", user_id)
         user = MwmblUser.objects.filter(id=user_id).first()
@@ -676,7 +677,7 @@ def polar_webhook(request):
             billing.polar_customer_id = event.data.customer_id or billing.polar_customer_id
             billing.polar_subscription_id = event.data.id or billing.polar_subscription_id
             billing.save()
-    elif event.type in ("subscription.revoked", "subscription.canceled"):
+    elif event_type in ("subscription.revoked", "subscription.canceled"):
         user_id = event.data.metadata.get("user_id")
         logger.info("Polar webhook: subscription revoked/canceled user_id=%s", user_id)
         user = MwmblUser.objects.filter(id=user_id).first()
@@ -688,7 +689,7 @@ def polar_webhook(request):
             user.save()
             invalidate_user_api_key_cache(user.id)
     else:
-        logger.info("Polar webhook: unhandled event type=%s, ignoring", event.type)
+        logger.info("Polar webhook: unhandled event type=%s, ignoring", event_type)
 
     return {"status": "ok"}
 
