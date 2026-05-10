@@ -642,8 +642,8 @@ def polar_webhook(request):
     logger.info("Polar webhook received")
     try:
         event = validate_event(
-            payload=request.body,
-            headers=request.headers,
+            body=request.body,
+            headers=dict(request.headers),
             secret=settings.POLAR_WEBHOOK_SECRET,
         )
     except WebhookVerificationError:
