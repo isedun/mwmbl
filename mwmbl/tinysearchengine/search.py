@@ -68,7 +68,7 @@ class SearchResult(Schema):
         }
 
 
-class SearchResult(Schema):
+class SearchHit(Schema):
     url: str
     title: str
     title_highlights: list[str]
@@ -82,7 +82,7 @@ class SearchResponse(Schema):
     """Search response with optional Mwmbl usage metadata."""
     query: str
     number_of_results: int
-    results: list[SearchResult]
+    results: list[SearchHit]
     monthly_usage: int | None = None
     monthly_limit: int | None = None
 
