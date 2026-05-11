@@ -68,8 +68,7 @@ class SearchResult(Schema):
         }
 
 
-class SearxResult(Schema):
-    """A single search result in SearXNG-compatible format."""
+class SearchResult(Schema):
     url: str
     title: str
     title_highlights: list[str]
@@ -80,10 +79,10 @@ class SearxResult(Schema):
 
 
 class SearchResponse(Schema):
-    """SearXNG-compatible search response with optional Mwmbl usage metadata."""
+    """Search response with optional Mwmbl usage metadata."""
     query: str
     number_of_results: int
-    results: list[SearxResult]
+    results: list[SearchResult]
     monthly_usage: int | None = None
     monthly_limit: int | None = None
 
