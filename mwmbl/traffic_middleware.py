@@ -19,9 +19,10 @@ class SearchTrafficMiddleware:
 
     def __call__(self, request):
         response = self.get_response(request)
-        # After the view, so resolver_match is populated. For the Super Search SSE view this
-        # is the start of the stream rather than the end of it, which is the right moment to
-        # count a search - but it means the response has no body to look at yet, and reading
-        # response.content would raise. Nothing here touches it.
-        record_request(request)
+        # After the view, so resolver_match is populated and the status code is known. For
+        # the Super Search SSE view this is the start of the stream rather than the end of
+        # it, which is the right moment to count a search - but it means the response has no
+        # body to look at yet, and reading response.content would raise. Only the status
+        # code is read here, never the body.
+        record_request(request, response)
         return response

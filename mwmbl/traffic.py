@@ -7,9 +7,10 @@ no request's behaviour changes.
 Deliberately raw. Classifying a request as a bot or a browser here would fix a taxonomy in
 the Redis keys before anyone has looked at the traffic, and a key dimension is not something
 you can change your mind about later. What is counted is what arrived: requests per
-endpoint, split by which of the two headers were present, and requests per verbatim user
-agent. Any rule about what a bot looks like then applies when the numbers are read, over
-strings we already have, and can be applied differently next week. #412 is where a
+endpoint, split by which of the two headers were present and by the status class that came
+back, and requests per verbatim user agent. Any rule about what a bot looks like then
+applies when the numbers are read, over strings we already have, and can be applied
+differently next week. #412 is where a
 classification earns its place, once there is data to design it against.
 """
 
@@ -21,7 +22,7 @@ from typing import Optional
 
 import redis
 from django.conf import settings
-from django.http import HttpRequest
+from django.http import HttpRequest, HttpResponse
 from redis.exceptions import RedisError
 
 from mwmbl.utils import utc_today
@@ -100,7 +101,20 @@ def header_label(request: HttpRequest) -> str:
     return "language" if has_language else "neither"
 
 
-REQUEST_COUNT_KEY = "traffic:req:{date}:{endpoint}:{headers}"
+# The status class the client got, and like the header split a description rather than a
+# judgement. A request that 4xx'd cost us a URL match and nothing else; one that 2xx'd cost
+# us a ranker run. Without this dimension a bot sending malformed queries that never reach
+# the index is indistinguishable from a visitor being served, which is the whole question
+# #410 is asking. The class rather than the code, because the codes are the view's business
+# and this counter should not have an opinion about how many of them there are.
+STATUS_LABELS = ["1xx", "2xx", "3xx", "4xx", "5xx"]
+
+
+def status_label(response: HttpResponse) -> str:
+    return f"{response.status_code // 100}xx"
+
+
+REQUEST_COUNT_KEY = "traffic:req:{date}:{endpoint}:{headers}:{status}"
 USER_AGENT_COUNT_KEY = "traffic:user-agents:{date}"
 
 # Thirty days, matching the public daily crawler counters in mwmbl/crawler/stats.py.
@@ -109,13 +123,12 @@ USER_AGENT_COUNT_KEY = "traffic:user-agents:{date}"
 TRAFFIC_EXPIRE_SECONDS = 60 * 60 * 24 * 30
 
 # Seven days for the user agents: they are here to be read and argued about, not to be a
-# permanent series, and a short window limits what a verbatim string can later be used for.
+# permanent series, and a week is long enough to see which clients come back.
 USER_AGENT_EXPIRE_SECONDS = 60 * 60 * 24 * 7
 
-# How many user agents a day survives, which is both the memory bound on a sorted set whose
-# members the caller chooses and the privacy control. What it drops is the tail, and a user
-# agent seen once is both most of a browser fingerprint and a lone person; what survives is
-# by construction a client somebody runs at volume.
+# The memory bound on a sorted set whose members the caller chooses. What it drops is the
+# tail, which is also the least interesting part of it: what these strings are here to find
+# is a client somebody runs at volume, and one seen once cannot be that.
 TRACKED_USER_AGENTS = 2000
 
 # Trimming on one request in five hundred holds the set within a few hundred rows of the
@@ -147,7 +160,7 @@ def get_redis() -> redis.Redis:
     return _redis
 
 
-def record_request(request: HttpRequest) -> None:
+def record_request(request: HttpRequest, response: HttpResponse) -> None:
     """Count one search request. Never raises: a counter that costs a search its results is
     worse than no counter, which is the rule external_cache already follows."""
     if not settings.SEARCH_TRAFFIC_COUNTING:
@@ -161,12 +174,15 @@ def record_request(request: HttpRequest) -> None:
     try:
         pipeline = get_redis().pipeline()
 
-        request_key = REQUEST_COUNT_KEY.format(date=today, endpoint=endpoint, headers=header_label(request))
+        request_key = REQUEST_COUNT_KEY.format(
+            date=today, endpoint=endpoint, headers=header_label(request), status=status_label(response)
+        )
         pipeline.incr(request_key)
         pipeline.expire(request_key, TRAFFIC_EXPIRE_SECONDS)
 
-        # Its own key, not a dimension on the counter above: nothing joins a user agent to
-        # an address or a query, so no row says a particular person searched for something.
+        # Its own key rather than another dimension on the counter above, because the user
+        # agent is the one part of this the caller chooses: crossed with endpoint, headers
+        # and status it would multiply an unbounded set by two hundred and forty.
         user_agent_key = USER_AGENT_COUNT_KEY.format(date=today)
         user_agent = request.headers.get("User-Agent", "")[:MAX_USER_AGENT_LENGTH] or MISSING_USER_AGENT
         pipeline.zincrby(user_agent_key, 1, user_agent)
@@ -179,23 +195,27 @@ def record_request(request: HttpRequest) -> None:
         logger.warning("Could not record search traffic for %s", endpoint, exc_info=True)
 
 
-def read_request_counts(redis_client, days: list[date]) -> dict[tuple[date, str, str], int]:
-    """Request counts for the given days, keyed by (day, endpoint, header label).
+def read_request_counts(redis_client, days: list[date]) -> dict[tuple[date, str, str, str], int]:
+    """Request counts for the given days, keyed by (day, endpoint, header label, status class).
 
     One mget over the known labels rather than a scan: nothing indexes which traffic keys
     exist, and SCAN on a shared Redis is not something a readout should do. Combinations
     with no traffic are absent rather than zero.
     """
     coordinates = [
-        (day, endpoint, headers) for day in days for endpoint in ALL_ENDPOINT_LABELS for headers in HEADER_LABELS
+        (day, endpoint, headers, status)
+        for day in days
+        for endpoint in ALL_ENDPOINT_LABELS
+        for headers in HEADER_LABELS
+        for status in STATUS_LABELS
     ]
     counts = redis_client.mget(
         [
-            REQUEST_COUNT_KEY.format(date=day, endpoint=endpoint, headers=headers)
-            for day, endpoint, headers in coordinates
+            REQUEST_COUNT_KEY.format(date=day, endpoint=endpoint, headers=headers, status=status)
+            for day, endpoint, headers, status in coordinates
         ]
     )
-    return {coordinate: int(count) for coordinate, count in zip(coordinates, counts) if count}
+    return {coordinate: int(count) for coordinate, count in zip(coordinates, counts) if count is not None}
 
 
 def read_user_agent_counts(redis_client, days: list[date], limit: int) -> list[tuple[str, int]]:
@@ -205,7 +225,7 @@ def read_user_agent_counts(redis_client, days: list[date], limit: int) -> list[t
     """
     pipeline = redis_client.pipeline()
     for day in days:
-        pipeline.zrevrange(USER_AGENT_COUNT_KEY.format(date=day), 0, TRACKED_USER_AGENTS, withscores=True)
+        pipeline.zrevrange(USER_AGENT_COUNT_KEY.format(date=day), 0, TRACKED_USER_AGENTS - 1, withscores=True)
 
     totals: Counter = Counter()
     for day_counts in pipeline.execute():

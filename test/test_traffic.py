@@ -5,6 +5,7 @@ that reaches for Redis and the CI job runs none. Everything here turns it back o
 in a fakeredis, the way test_admin_blacklist_status.py does.
 """
 
+import logging
 from datetime import timedelta
 
 import fakeredis
@@ -12,9 +13,10 @@ import pytest
 from asgiref.sync import iscoroutinefunction, markcoroutinefunction
 from django.conf import settings
 from django.core.handlers.base import BaseHandler
-from django.http import StreamingHttpResponse
+from django.http import HttpResponseServerError, StreamingHttpResponse
 from django.test import override_settings
 from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from mwmbl import traffic
 from mwmbl.traffic_middleware import SearchTrafficMiddleware
@@ -54,8 +56,8 @@ def counting(monkeypatch, settings):
     return client
 
 
-def count_for(endpoint, headers="user_agent+language"):
-    key = traffic.REQUEST_COUNT_KEY.format(date=utc_today(), endpoint=endpoint, headers=headers)
+def count_for(endpoint, headers="user_agent+language", status="2xx"):
+    key = traffic.REQUEST_COUNT_KEY.format(date=utc_today(), endpoint=endpoint, headers=headers, status=status)
     return traffic.get_redis().get(key)
 
 
@@ -152,14 +154,50 @@ def test_every_search_route_has_a_label():
 def test_the_headers_that_arrived_are_counted_and_nothing_is_inferred_from_them(counting, client, headers, expected):
     client.get("/api/v1/search/", {"s": "python"}, **headers)
 
-    assert count_for("v1_search", expected) == "1"
+    assert count_for("v1_search", headers=expected) == "1"
+
+
+@pytest.mark.parametrize(
+    "request_args,expected_status",
+    [
+        # A query that reached the ranker, and one that never got past validation.
+        (("get", "/api/v1/search/", {"s": "python"}), "2xx"),
+        (("get", "/api/v1/search/", {}), "4xx"),
+        # Routed, so it is counted, but no view ever ran.
+        (("head", "/api/v1/search/", {"s": "python"}), "4xx"),
+    ],
+)
+def test_what_the_request_cost_us_is_counted_separately_from_whether_it_was_served(
+    counting, client, request_args, expected_status
+):
+    """Without this split a bot sending malformed queries looks like a served visitor."""
+    method, path, query = request_args
+    getattr(client, method)(path, query, **BROWSER_HEADERS)
+
+    assert count_for("v1_search", status=expected_status) == "1"
+    others = [status for status in traffic.STATUS_LABELS if status != expected_status]
+    assert all(count_for("v1_search", status=status) is None for status in others)
+
+
+def test_a_server_error_is_counted_as_one(counting, rf):
+    """A view that broke still cost us whatever it did before it broke.
+
+    Django's innermost convert_exception_to_response turns a raised view into a 500 before
+    any middleware above it runs, so a response is what this sees either way.
+    """
+    request = rf.get("/api/v1/search/", {"s": "python"}, **BROWSER_HEADERS)
+    request.resolver_match = type("Match", (), {"view_name": "api-v1:search"})()
+
+    SearchTrafficMiddleware(lambda _: HttpResponseServerError())(request)
+
+    assert count_for("v1_search", status="5xx") == "1"
 
 
 def test_the_counters_expire(counting, client):
     client.get("/api/v1/search/", {"s": "python"}, **BROWSER_HEADERS)
 
     requests_key = traffic.REQUEST_COUNT_KEY.format(
-        date=utc_today(), endpoint="v1_search", headers="user_agent+language"
+        date=utc_today(), endpoint="v1_search", headers="user_agent+language", status="2xx"
     )
     user_agents_key = traffic.USER_AGENT_COUNT_KEY.format(date=utc_today())
     assert 0 < counting.ttl(requests_key) <= traffic.TRAFFIC_EXPIRE_SECONDS
@@ -219,8 +257,8 @@ def test_the_readout_returns_a_count_per_day_endpoint_and_header_combination(cou
     counts = traffic.read_request_counts(counting, [utc_today()])
 
     assert counts == {
-        (utc_today(), "v1_search", "user_agent+language"): 2,
-        (utc_today(), "v2_search", "neither"): 1,
+        (utc_today(), "v1_search", "user_agent+language", "2xx"): 2,
+        (utc_today(), "v2_search", "neither", "2xx"): 1,
     }
 
 
@@ -231,19 +269,58 @@ def test_the_readout_survives_a_day_with_no_traffic(counting):
     assert traffic.read_user_agent_counts(counting, days, 10) == []
 
 
-def test_a_dead_redis_does_not_change_the_response(client, monkeypatch, settings):
+@pytest.mark.parametrize("failure", [RedisConnectionError("Connection refused"), RedisTimeoutError("Timed out")])
+def test_a_dead_redis_does_not_change_the_response(client, monkeypatch, settings, caplog, failure):
+    """The failure is raised from execute(), which is the only part of this that does I/O.
+
+    redis.Redis.pipeline() just builds an object, so a client that raises there would be
+    testing a path production cannot take.
+    """
+
+    class DeadPipeline:
+        def __getattr__(self, _name):
+            return lambda *args, **kwargs: None
+
+        def execute(self):
+            raise failure
+
     class DeadRedis:
         def pipeline(self):
-            raise RedisConnectionError("Connection refused")
+            return DeadPipeline()
 
     with_counting_off = client.get("/api/v1/search/", {"s": "python"}, **BROWSER_HEADERS)
 
     settings.SEARCH_TRAFFIC_COUNTING = True
     monkeypatch.setattr(traffic, "_redis", DeadRedis())
-    with_dead_redis = client.get("/api/v1/search/", {"s": "python"}, **BROWSER_HEADERS)
+    with caplog.at_level(logging.WARNING, logger="mwmbl.traffic"):
+        with_dead_redis = client.get("/api/v1/search/", {"s": "python"}, **BROWSER_HEADERS)
 
     assert with_dead_redis.status_code == with_counting_off.status_code == 200
     assert with_dead_redis.content == with_counting_off.content
+    assert "Could not record search traffic for v1_search" in caplog.text
+
+
+def test_the_client_is_built_for_a_counter_rather_than_a_cache(monkeypatch, settings):
+    """get_redis() is the one part of this module the other tests never execute, because
+    they all inject traffic._redis. Its arguments are what keeps a sick Redis from being a
+    slow search, so changing any of them should fail here rather than in production."""
+    monkeypatch.setattr(traffic, "_redis", None)
+    settings.REDIS_URL = "redis://redis.example:6379"
+
+    pool = traffic.get_redis().connection_pool
+
+    assert (pool.connection_kwargs["host"], pool.connection_kwargs["port"]) == ("redis.example", 6379)
+    # Bytes here would make read_user_agent_counts return unusable keys in production.
+    assert pool.connection_kwargs["decode_responses"] is True
+    assert pool.connection_kwargs["socket_connect_timeout"] == traffic.REDIS_CONNECT_TIMEOUT_SECONDS
+    assert pool.connection_kwargs["socket_timeout"] == traffic.REDIS_TIMEOUT_SECONDS
+    # And no retries, which is what bounds a stalled Redis at one socket timeout rather than
+    # four of them plus redis-py's second-scale backoff. The client default is three retries;
+    # what suppresses it is that ConnectionPool.from_url does not forward it to the
+    # connection. Constructing a connection is the only way to see the value that results,
+    # and does no I/O.
+    connection = pool.connection_class(**pool.connection_kwargs)
+    assert connection.retry.get_retries() == 0
 
 
 def test_a_streaming_response_is_counted_without_being_consumed(counting, rf):
